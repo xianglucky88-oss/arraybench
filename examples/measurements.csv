@@ -1,0 +1,4 @@
+time,station,height,temperature,temperature_unit,pressure,pressure_unit
+2026-11-01T08:00:00+08:00,east,10,293.15,K,101300,Pa
+2026-11-01T00:10:00Z,east,10,22,degC,101.4,kPa
+2026-11-01T00:20:00Z,west,20,,degC,101.2,kPa

@@ -1,0 +1,1 @@
+{"dimensions":{"station":"str","height":"float"},"variables":{"temperature":{"unit":"degC","min":-100,"max":100},"pressure":{"unit":"kPa","min":0}},"bucket_seconds":3600,"chunk_rows":2,"max_bucket_rows":10000,"max_batch_rows":10000}
