@@ -182,6 +182,26 @@ class Dataset:
                        "variance": a["m2"] / a["count"] if a["count"] else None, "min": a["min"], "max": a["max"]}
                 for name, a in accumulators.items()}
 
+    def segment(self, start, end, variable, *, penalty, min_points,
+                min_span_seconds, max_gap_seconds, coordinates=None,
+                version=None, limits=None):
+        """Independent univariate changepoint analysis on a fixed snapshot.
+
+        Reuses the half-open ``window`` read path only -- normalized rows are
+        consumed read-only.  No unit reinterpretation, gap filling or
+        resampling happens here.
+        """
+        from .segmentation import segment_rows
+        snapshot = self.snapshot(version)
+        snapshot_id = version or self.store.head()
+        rows = self.window(start, end, coordinates=coordinates, version=snapshot_id)
+        return segment_rows(
+            rows, schema=snapshot["schema"], variable=variable,
+            snapshot_id=snapshot_id, start=start, end=end,
+            penalty=penalty, min_points=min_points,
+            min_span_seconds=min_span_seconds, max_gap_seconds=max_gap_seconds,
+            limits=limits)
+
     def rollback(self, target, expected=None):
         with self.store.lock():
             parent = self.store.head()
