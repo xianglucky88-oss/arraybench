@@ -27,7 +27,11 @@ with tempfile.TemporaryDirectory() as directory:
     if stats["temperature"]["mean"] != 21 or stats["temperature"]["missing"] != 1: raise RuntimeError("statistics failed")
     resampled = cli(root, "resample", start, end, "--seconds", "3600")
     if len(resampled) != 2: raise RuntimeError("spatial dimensions lost during resampling")
+    streamed = cli(root, "append-stream", project / "examples" / "measurements.csv",
+                   "--duplicates", "update", "--invalid", "missing")["version"]
+    if len(cli(root, "window", start, end)) != 3: raise RuntimeError("streamed append changed cardinality")
     cli(root, "rollback", initial)
     if cli(root, "window", start, end): raise RuntimeError("rollback did not clear rows")
     if len(cli(root, "window", start, end, "--version", v1)) != 3: raise RuntimeError("historical snapshot mutated")
-    print(json.dumps({"ok": True, "measurements": 3, "temperature_mean": 21, "resampled_series": 2, "historical_read": True, "cli_processes": 8}))
+    if len(cli(root, "window", start, end, "--version", streamed)) != 3: raise RuntimeError("streamed snapshot mutated")
+    print(json.dumps({"ok": True, "measurements": 3, "temperature_mean": 21, "resampled_series": 2, "historical_read": True, "cli_processes": 10}))

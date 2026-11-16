@@ -1,4 +1,5 @@
 """Affine unit registry: (physical dimension, scale, offset to base unit)."""
+import copy
 import math
 from datetime import datetime, timezone
 
@@ -17,6 +18,12 @@ class UnitRegistry:
         if name in self.units or not math.isfinite(scale) or scale == 0 or not math.isfinite(offset):
             raise ValueError("invalid or duplicate unit")
         self.units[name] = dimension, scale, offset
+
+    def frozen(self):
+        """Copy the unit table so a prepared batch cannot observe later changes."""
+        frozen = copy.copy(self)
+        frozen.units = dict(self.units)
+        return frozen
 
     def convert(self, value, source, target):
         if source not in self.units or target not in self.units:

@@ -29,6 +29,10 @@ def main():
     ingest.add_argument("input")
     ingest.add_argument("--duplicates", choices=["error", "update", "ignore"], default="error")
     ingest.add_argument("--invalid", choices=["reject", "missing"], default="reject")
+    stream = sub.add_parser("append-stream")
+    stream.add_argument("input")
+    stream.add_argument("--duplicates", choices=["error", "update", "ignore"], default="error")
+    stream.add_argument("--invalid", choices=["reject", "missing"], default="reject")
     sub.add_parser("inspect")
     restore = sub.add_parser("rollback")
     restore.add_argument("version")
@@ -45,6 +49,8 @@ def main():
             with open(args.schema, encoding="utf-8") as stream: result = {"version": dataset.create(json.load(stream))}
         elif args.command == "append":
             result = {"version": dataset.append(input_rows(args.input, dataset.snapshot()["schema"]), duplicates=args.duplicates, invalid=args.invalid)}
+        elif args.command == "append-stream":
+            result = {"version": dataset.append_stream(input_rows(args.input, dataset.snapshot()["schema"]), duplicates=args.duplicates, invalid=args.invalid)}
         elif args.command == "inspect": result = dataset.snapshot()
         elif args.command == "rollback": result = {"version": dataset.rollback(args.version)}
         elif args.command == "stats": result = dataset.stats(args.start, args.end, version=args.version)

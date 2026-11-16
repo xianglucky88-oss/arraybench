@@ -8,6 +8,10 @@ from contextlib import contextmanager
 from pathlib import Path
 
 
+class SnapshotConflict(ValueError):
+    """The base snapshot moved before this batch could be published."""
+
+
 def encode(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
 
@@ -16,7 +20,7 @@ class ChunkStore:
     def __init__(self, root):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
-        for directory in ("chunks", "snapshots"):
+        for directory in ("chunks", "snapshots", "staging"):
             (self.root / directory).mkdir(exist_ok=True)
 
     @contextmanager
@@ -61,4 +65,24 @@ class ChunkStore:
     def commit(self, snapshot):
         sha = self.put("snapshots", snapshot)
         self.write(self.root / "HEAD", sha.encode())
+        return sha
+
+    def publish(self, snapshot, base):
+        """Commit a prepared snapshot only if HEAD still names ``base``."""
+        with self.lock():
+            if self.head() != base:
+                raise SnapshotConflict("snapshot revision conflict")
+            return self.commit(snapshot)
+
+    def publish_object(self, sha, base):
+        """Point HEAD at an already written snapshot object if the base matches.
+
+        The object is re-read and checksum-verified before the pointer moves,
+        so a truncated or hand-edited snapshot can never become HEAD.
+        """
+        self.get("snapshots", sha)
+        with self.lock():
+            if self.head() != base:
+                raise SnapshotConflict("snapshot revision conflict")
+            self.write(self.root / "HEAD", sha.encode())
         return sha

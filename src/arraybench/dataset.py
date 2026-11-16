@@ -1,15 +1,89 @@
 import json
 import math
+import shutil
+import tempfile
 from collections import defaultdict
-from .storage import ChunkStore
+from pathlib import Path
+
+from .storage import ChunkStore, SnapshotConflict
+from .streaming import ResidencyProbe, Staging
 from .units import UnitRegistry, epoch, iso
+
+
+class PreparedAppend:
+    """A fully normalized and chunked batch that has not touched HEAD yet.
+
+    Preparing consumes the source generator exactly once, spills rows to
+    staging and writes immutable chunks.  Publishing re-checks that HEAD still
+    points at the snapshot fixed during preparation; any concurrent writer
+    makes the whole batch fail without merging with the newer state.
+    """
+
+    def __init__(self, store, base, snapshot, staging, consumed, bucket_merges,
+                 input_peak, merge_peaks):
+        self.store = store
+        self.base = base
+        self.snapshot = snapshot
+        self.consumed_rows = consumed
+        self.staged_rows = staging.row_count
+        self.bucket_merges = bucket_merges
+        self.input_peak = input_peak
+        self.merge_peaks = merge_peaks
+        self.merge_peak = max(merge_peaks.values(), default=0)
+        self.version = None
+        self._staging = staging
+        self._done = False
+
+    @property
+    def staging_directory(self):
+        """Temporary index location; removed by ``publish``/``discard``."""
+        return self._staging.directory
+
+    def publish(self):
+        if self._done:
+            raise ValueError("prepared batch is already finished")
+        self._done = True
+        try:
+            # Writing the snapshot object is not a commit: HEAD still names
+            # ``base`` until publish_object succeeds under the write lock.
+            sha = self.store.put("snapshots", self.snapshot)
+            self.version = self.store.publish_object(sha, self.base)
+            return self.version
+        finally:
+            self.close()
+
+    def discard(self):
+        """Remove this batch's staging; never touches HEAD.
+
+        Chunks already written stay in the content-addressed store because they
+        may be shared with other revisions or in-flight batches.  Unreferenced
+        chunks are inert: no snapshot names them, so they are not a version.
+        """
+        if not self._done:
+            self._done = True
+            self.close()
+
+    def close(self):
+        self._staging.close()
+        shutil.rmtree(self._staging.directory, ignore_errors=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        # A context manager guards cleanup only; publishing is always explicit
+        # so an interrupted ``with`` body cannot accidentally commit.
+        self.discard()
+        return False
 
 
 class Dataset:
     """Sparse arrays indexed by UTC time plus typed spatial coordinates.
 
-    One time bucket is loaded at a time. Configured batch/bucket limits bound
-    memory; immutable chunks provide snapshots and partial copy-on-write updates.
+    ``append`` loads one bounded logical batch at a time.  ``prepare_append``
+    streams an arbitrarily long batch through a disk-backed index, then merges
+    one bucket at a time.  Immutable chunks provide snapshots and copy-on-write
+    updates; unchanged buckets keep their original chunk objects.
     """
     def __init__(self, root, registry=None):
         self.store = ChunkStore(root)
@@ -51,7 +125,8 @@ class Dataset:
     def _key(row):
         return row["t"], json.dumps(row["coordinates"], sort_keys=True, separators=(",", ":"))
 
-    def _normalize(self, row, schema, invalid):
+    def _normalize(self, row, schema, invalid, registry=None):
+        units = registry or self.units
         if set(row.get("coordinates", {})) != set(schema["dimensions"]):
             raise ValueError("coordinates do not match declared dimensions")
         if set(row.get("values", {})) != set(schema["variables"]):
@@ -75,9 +150,9 @@ class Dataset:
         for variable, spec in schema["variables"].items():
             unit = supplied_units.get(variable, spec["unit"])
             # Dimensional errors are never converted to missing data.
-            self.units.convert(None, unit, spec["unit"])
+            units.convert(None, unit, spec["unit"])
             try:
-                value = self.units.convert(row["values"][variable], unit, spec["unit"])
+                value = units.convert(row["values"][variable], unit, spec["unit"])
                 if value is not None and (("min" in spec and value < spec["min"]) or ("max" in spec and value > spec["max"])):
                     raise ValueError("measurement outside valid range")
             except (ValueError, TypeError):
@@ -119,6 +194,209 @@ class Dataset:
                 size = schema["chunk_rows"]
                 updated[bucket] = [self.store.put("chunks", ordered[i:i + size]) for i in range(0, len(ordered), size)]
             return self.store.commit({**previous, "revision": previous["revision"] + 1, "parent": parent, "buckets": updated})
+
+    # ------------------------------------------------------------------
+    # Streaming append protocol
+    #
+    # ``append`` above still enforces ``max_batch_rows`` by failing the whole
+    # call, which is the historic contract.  ``prepare_append`` accepts a
+    # logical batch of unbounded length: it consumes the iterable once,
+    # spills normalized rows to disk, and only then merges bucket by bucket.
+    # ``max_batch_rows`` now bounds the input buffer that is resident at any
+    # instant rather than the logical batch size.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _key_text(coordinates):
+        # Must stay byte-identical to ``_key`` so staged rows dedupe against
+        # rows written by older versions and SQLite's BINARY order matches.
+        return json.dumps(coordinates, sort_keys=True, separators=(",", ":"))
+
+    def _iter_old_rows(self, chunk_shas, probe):
+        """Yield old rows in key order, holding at most one chunk at a time."""
+        for sha in chunk_shas:
+            chunk = self.store.get("chunks", sha)
+            probe.hold(len(chunk), "old")
+            try:
+                for row in chunk:
+                    yield row
+            finally:
+                probe.release(len(chunk), "old")
+
+    @staticmethod
+    def _pair(record):
+        """Project a staged ``(t, coord, ...)`` row onto its merge key."""
+        return record[0], record[1]
+
+    def _validate_error_mode(self, old_shas, staging, bucket, schema, probe):
+        """Reject duplicates across old chunks and the whole staged bucket.
+
+        Only ``(t, coord, count)`` groups are compared, so a key repeated
+        through a long stream never has more than one record resident.  The
+        bucket row limit is checked only after duplicates, matching the
+        one-shot append where duplicate detection runs before the size check.
+        """
+        old_iter = self._iter_old_rows(old_shas, probe)
+        group_iter = staging.key_counts(bucket, probe)
+        old_row, group = next(old_iter, None), next(group_iter, None)
+        total = 0
+        try:
+            while old_row is not None or group is not None:
+                old_key = self._key(old_row) if old_row is not None else None
+                group_key = self._pair(group) if group is not None else None
+                if group_key is not None and group[2] > 1:
+                    raise ValueError("duplicate coordinate and timestamp")
+                if old_key is not None and group_key is not None and old_key == group_key:
+                    raise ValueError("duplicate coordinate and timestamp")
+                if group_key is not None and (old_key is None or group_key < old_key):
+                    total += 1
+                    group = next(group_iter, None)
+                else:
+                    total += 1
+                    old_row = next(old_iter, None)
+        finally:
+            old_iter.close()
+            group_iter.close()
+        if total > schema["max_bucket_rows"]:
+            raise ValueError("bucket memory limit exceeded")
+        return total
+
+    def _merge_bucket(self, previous, bucket, staging, schema, duplicates, probe):
+        """Merge one old bucket with staged rows into fresh chunks.
+
+        Old rows stream chunk by chunk and staged winners stream through a
+        bounded fetch window; one output chunk is buffered before hashing.
+        Resident records therefore stay below ``3 * chunk_rows``.
+        """
+        old_shas = previous["buckets"].get(bucket, [])
+        if duplicates == "error":
+            # Duplicate validation must precede any bucket-size error, and it
+            # must see the entire bucket before chunks are emitted.
+            self._validate_error_mode(old_shas, staging, bucket, schema, probe)
+        size = schema["chunk_rows"]
+        written, buffer, count = [], [], 0
+
+        def flush():
+            if buffer:
+                written.append(self.store.put("chunks", list(buffer)))
+                probe.release(len(buffer), "out")
+                buffer.clear()
+
+        def emit(row):
+            nonlocal count
+            count += 1
+            if count > schema["max_bucket_rows"]:
+                raise ValueError("bucket memory limit exceeded")
+            buffer.append(row)
+            probe.hold(1, "out")
+            if len(buffer) >= size:
+                flush()
+
+        old_iter = self._iter_old_rows(old_shas, probe)
+        winner_iter = staging.winners(bucket, newest=(duplicates == "update"), probe=probe)
+        completed = False
+        try:
+            old_row, winner = next(old_iter, None), next(winner_iter, None)
+            while old_row is not None or winner is not None:
+                old_key = self._key(old_row) if old_row is not None else None
+                new_key = self._pair(winner) if winner is not None else None
+                if old_key is not None and new_key is not None and old_key == new_key:
+                    # ``update`` takes the batch winner, ``ignore`` keeps old,
+                    # and ``error`` already validated that no collision exists.
+                    emit(json.loads(winner[2]) if duplicates == "update" else old_row)
+                    old_row, winner = next(old_iter, None), next(winner_iter, None)
+                elif new_key is not None and (old_key is None or new_key < old_key):
+                    emit(json.loads(winner[2]))
+                    winner = next(winner_iter, None)
+                else:
+                    emit(old_row)
+                    old_row = next(old_iter, None)
+            flush()
+            completed = True
+        finally:
+            old_iter.close()
+            winner_iter.close()
+            if not completed:
+                # A failed merge must not report a partial bucket as its result.
+                probe.release(len(buffer), "out")
+                buffer.clear()
+        return written
+
+    def prepare_append(self, rows, *, duplicates="error", invalid="reject", expected=None,
+                       staging_root=None):
+        """Normalize one logical batch without holding the global write lock.
+
+        The source iterable is consumed exactly once.  Up to ``max_batch_rows``
+        normalized records are resident before being spilled; at most one
+        fetch window plus one output chunk (bounded by ``chunk_rows``) is
+        resident while a bucket is merged.  The returned object publishes
+        atomically or raises :class:`SnapshotConflict` if HEAD moved.
+        """
+        if duplicates not in ("error", "update", "ignore") or invalid not in ("reject", "missing"):
+            raise ValueError("invalid ingestion policy")
+        base = self.store.head()
+        if base is None:
+            raise ValueError("dataset is not initialized")
+        previous = self.snapshot(base)
+        if expected is not None and expected != base:
+            raise SnapshotConflict("snapshot revision conflict")
+        # Fix schema and unit definitions for the whole preparation phase.
+        schema = json.loads(json.dumps(previous["schema"]))
+        registry = self.units.frozen()
+        probe = ResidencyProbe()
+        directory = Path(staging_root) if staging_root is not None else self.store.root / "staging"
+        directory.mkdir(parents=True, exist_ok=True)
+        staging_dir = Path(tempfile.mkdtemp(prefix="batch-", dir=directory))
+        staging = Staging(staging_dir, schema["chunk_rows"])
+        width = schema["bucket_seconds"] * 1000000
+        limit = schema["max_batch_rows"]
+        buffer, seq, consumed = [], 0, 0
+        try:
+            try:
+                for row in rows:
+                    consumed += 1
+                    normalized = self._normalize(row, schema, invalid, registry)
+                    bucket = str(normalized["t"] // width)
+                    buffer.append((bucket, normalized["t"], self._key_text(normalized["coordinates"]),
+                                   seq, json.dumps(normalized, ensure_ascii=False, sort_keys=True,
+                                                   separators=(",", ":"), allow_nan=False)))
+                    probe.hold(1, "input")
+                    seq += 1
+                    if len(buffer) >= limit:
+                        staging.add_many(buffer)
+                        probe.release(len(buffer), "input")
+                        buffer.clear()
+                if buffer:
+                    staging.add_many(buffer)
+                    probe.release(len(buffer), "input")
+                    buffer.clear()
+            except BaseException:
+                probe.release(len(buffer), "input")
+                buffer.clear()
+                raise
+            staging.finish()
+            input_peak = probe.peak
+            updated = dict(previous["buckets"])
+            merge_peaks = {}
+            for bucket in staging.buckets():
+                probe.reset_peak()
+                updated[bucket] = self._merge_bucket(previous, bucket, staging, schema, duplicates, probe)
+                merge_peaks[bucket] = probe.peak
+                probe.reset_peak()
+            if probe.live != 0:
+                raise AssertionError("residency accounting leaked records")
+            snapshot = {**previous, "revision": previous["revision"] + 1,
+                        "parent": base, "buckets": updated}
+            return PreparedAppend(self.store, base, snapshot, staging, consumed,
+                                  len(merge_peaks), input_peak, merge_peaks)
+        except BaseException:
+            staging.close()
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+
+    def append_stream(self, rows, **kwargs):
+        """Prepare and atomically publish one streamed logical batch."""
+        return self.prepare_append(rows, **kwargs).publish()
 
     def window(self, start, end, *, coordinates=None, version=None):
         start, end = epoch(start), epoch(end)

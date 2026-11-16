@@ -4,4 +4,6 @@ test:
 	PYTHONPATH=src $(PYTHON) -m unittest discover -s tests -v
 demo:
 	PYTHONPATH=src $(PYTHON) examples/smoke.py
-check: test demo
+bench:
+	PYTHONPATH=src $(PYTHON) examples/streaming_bench.py
+check: test demo bench
